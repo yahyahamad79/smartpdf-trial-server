@@ -4,29 +4,21 @@ Smart PDF — Trial & Privacy Server
 A single small FastAPI service that provides:
   1. Trial management per device (POST /trial/check)
   2. Privacy policy page (GET /privacy)
-  3. PDF page rendering for preview (POST /render-page)  <-- NEW
 
 The trial start date is stored ON THE SERVER (SQLite), keyed by the
 device's Android ID. Reinstalling the app does NOT reset the trial,
 because the server remembers the device.
 
-The /render-page endpoint renders a SINGLE PDF page to a PNG image,
-so the mobile app can show a real preview WITHOUT any native library
-(it just displays a normal <Image>). This keeps the app fully offline
-by default; preview is an online-only extra.
-
 Deploy on Render as a Web Service.
 """
 
 import os
-import io
 import sqlite3
 from datetime import datetime, timezone
 from contextlib import closing
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # ------------------------------------------------------------------
@@ -35,23 +27,7 @@ from pydantic import BaseModel
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 DB_PATH = os.environ.get("DB_PATH", "trial.db")
 
-# Max upload size for rendering (MB) — protects the free server
-MAX_RENDER_MB = int(os.environ.get("MAX_RENDER_MB", "25"))
-# Render scale (higher = sharper but heavier). 2.0 is a good preview balance.
-RENDER_ZOOM = float(os.environ.get("RENDER_ZOOM", "2.0"))
-
 app = FastAPI(title="Smart PDF Trial Server")
-
-# ------------------------------------------------------------------
-# CORS — allow the mobile app to call the render endpoint
-# ------------------------------------------------------------------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],          # mobile app has no fixed origin
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 # ------------------------------------------------------------------
@@ -124,62 +100,6 @@ def trial_check(req: TrialRequest):
         daysLeft=days_left,
         trialDays=TRIAL_DAYS,
         firstSeen=first_seen.date().isoformat(),
-    )
-
-
-# ------------------------------------------------------------------
-# PDF page rendering endpoint (for preview) — NEW
-# ------------------------------------------------------------------
-@app.post("/render-page")
-async def render_page(
-    file: UploadFile = File(...),
-    page: int = Form(0),          # 0-based page index
-    zoom: float = Form(None),     # optional override
-):
-    """
-    Render ONE page of an uploaded PDF to a PNG image.
-    Returns the PNG bytes directly (image/png).
-    The uploaded file is processed in memory and never stored on disk.
-    """
-    # Lazy import so the server still boots even if PyMuPDF is missing
-    try:
-        import fitz  # PyMuPDF
-    except Exception:
-        raise HTTPException(status_code=500, detail="Renderer not available on server")
-
-    # Read upload with a size guard
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file")
-    if len(data) > MAX_RENDER_MB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"File too large (>{MAX_RENDER_MB}MB)")
-
-    use_zoom = zoom if (zoom and zoom > 0) else RENDER_ZOOM
-    # clamp zoom to a sane range
-    use_zoom = max(1.0, min(use_zoom, 3.0))
-
-    try:
-        doc = fitz.open(stream=data, filetype="pdf")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid PDF")
-
-    try:
-        total = doc.page_count
-        if total == 0:
-            raise HTTPException(status_code=400, detail="PDF has no pages")
-        # clamp page index
-        idx = max(0, min(page, total - 1))
-        pdf_page = doc.load_page(idx)
-        matrix = fitz.Matrix(use_zoom, use_zoom)
-        pix = pdf_page.get_pixmap(matrix=matrix, alpha=False)
-        png_bytes = pix.tobytes("png")
-    finally:
-        doc.close()
-
-    return StreamingResponse(
-        io.BytesIO(png_bytes),
-        media_type="image/png",
-        headers={"X-Total-Pages": str(total)},
     )
 
 
