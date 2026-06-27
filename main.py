@@ -40,6 +40,26 @@ MAX_RENDER_MB = int(os.environ.get("MAX_RENDER_MB", "25"))
 # Render scale (higher = sharper but heavier). 2.0 is a good preview balance.
 RENDER_ZOOM = float(os.environ.get("RENDER_ZOOM", "2.0"))
 
+# Session store for "upload once" — keeps the PDF bytes in memory keyed by
+# a session id, so the app uploads the file ONCE and then requests pages by id
+# (no re-upload per page). Sessions expire after SESSION_TTL seconds.
+import uuid
+import time as _time
+SESSION_TTL = int(os.environ.get("SESSION_TTL", "1800"))  # 30 minutes
+MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "40"))   # cap memory use
+_sessions = {}  # sid -> {"data": bytes, "total": int, "ts": float}
+
+def _purge_sessions():
+    now = _time.time()
+    expired = [k for k, v in _sessions.items() if now - v["ts"] > SESSION_TTL]
+    for k in expired:
+        _sessions.pop(k, None)
+    # if still too many, drop oldest
+    if len(_sessions) > MAX_SESSIONS:
+        oldest = sorted(_sessions.items(), key=lambda kv: kv[1]["ts"])
+        for k, _ in oldest[: len(_sessions) - MAX_SESSIONS]:
+            _sessions.pop(k, None)
+
 app = FastAPI(title="Smart PDF Trial Server")
 
 # ------------------------------------------------------------------
@@ -169,6 +189,84 @@ async def render_page(
             raise HTTPException(status_code=400, detail="PDF has no pages")
         # clamp page index
         idx = max(0, min(page, total - 1))
+        pdf_page = doc.load_page(idx)
+        matrix = fitz.Matrix(use_zoom, use_zoom)
+        pix = pdf_page.get_pixmap(matrix=matrix, alpha=False)
+        png_bytes = pix.tobytes("png")
+    finally:
+        doc.close()
+
+    return StreamingResponse(
+        io.BytesIO(png_bytes),
+        media_type="image/png",
+        headers={"X-Total-Pages": str(total)},
+    )
+
+
+
+# ------------------------------------------------------------------
+# Upload-once session endpoints — NEW (efficient for large PDFs)
+# ------------------------------------------------------------------
+@app.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    """
+    Upload a PDF ONCE. Returns a sessionId + total page count.
+    The app then calls /render/{sid}/{page} per page WITHOUT re-uploading.
+    Stored in memory only, auto-expires.
+    """
+    try:
+        import fitz
+    except Exception:
+        raise HTTPException(status_code=500, detail="Renderer not available on server")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(data) > MAX_RENDER_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"File too large (>{MAX_RENDER_MB}MB)")
+
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+        total = doc.page_count
+        doc.close()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid PDF")
+    if total == 0:
+        raise HTTPException(status_code=400, detail="PDF has no pages")
+
+    _purge_sessions()
+    sid = uuid.uuid4().hex
+    _sessions[sid] = {"data": data, "total": total, "ts": _time.time()}
+    return {"sessionId": sid, "totalPages": total}
+
+
+@app.get("/render/{sid}/{page}")
+def render_by_session(sid: str, page: int, zoom: float = None):
+    """
+    Render ONE page from a previously uploaded session (by sessionId).
+    No re-upload needed. page is 1-based here for convenience.
+    """
+    try:
+        import fitz
+    except Exception:
+        raise HTTPException(status_code=500, detail="Renderer not available on server")
+
+    sess = _sessions.get(sid)
+    if not sess:
+        # 410 Gone tells the app to re-upload
+        raise HTTPException(status_code=410, detail="Session expired")
+    sess["ts"] = _time.time()  # refresh TTL on use
+
+    use_zoom = zoom if (zoom and zoom > 0) else RENDER_ZOOM
+    use_zoom = max(1.0, min(use_zoom, 3.0))
+
+    try:
+        doc = fitz.open(stream=sess["data"], filetype="pdf")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid PDF")
+    try:
+        total = doc.page_count
+        idx = max(0, min(page - 1, total - 1))  # page is 1-based
         pdf_page = doc.load_page(idx)
         matrix = fitz.Matrix(use_zoom, use_zoom)
         pix = pdf_page.get_pixmap(matrix=matrix, alpha=False)
