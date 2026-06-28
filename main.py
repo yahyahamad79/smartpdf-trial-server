@@ -227,10 +227,11 @@ async def compress_pdf(file: UploadFile = File(...), level: str = Form("medium")
     if len(data) > MAX_RENDER_MB * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"File too large (>{MAX_RENDER_MB}MB)")
 
+    # مستويات الضغp -> (dpi_target, quality)
     presets = {
-        "low":    {"quality": 75, "max_dim": 2000},
-        "medium": {"quality": 55, "max_dim": 1500},
-        "high":   {"quality": 38, "max_dim": 1100},
+        "low":    {"dpi": 120, "quality": 70},   # خفيف: جودة أعلى
+        "medium": {"dpi": 96,  "quality": 55},   # متوازن
+        "high":   {"dpi": 72,  "quality": 40},   # ضغp أقوى
     }
     cfg = presets.get(level, presets["medium"])
 
@@ -240,33 +241,15 @@ async def compress_pdf(file: UploadFile = File(...), level: str = Form("medium")
         raise HTTPException(status_code=400, detail="Invalid PDF")
 
     try:
-        for page_index in range(doc.page_count):
-            page = doc.load_page(page_index)
-            for img in page.get_images(full=True):
-                xref = img[0]
-                try:
-                    pix = fitz.Pixmap(doc, xref)
-                    if pix.width < 50 or pix.height < 50:
-                        pix = None
-                        continue
-                    if pix.n >= 5 or pix.alpha:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                    max_dim = cfg["max_dim"]
-                    if max(pix.width, pix.height) > max_dim:
-                        scale = max_dim / max(pix.width, pix.height)
-                        new_w = max(1, int(pix.width * scale))
-                        new_h = max(1, int(pix.height * scale))
-                        pix = _resize_pix(fitz, pix, new_w, new_h)
-                    new_bytes = pix.tobytes("jpeg", jpg_quality=cfg["quality"])
-                    doc.update_stream(xref, new_bytes, new=True)
-                    doc.xref_set_key(xref, "Filter", "/DCTDecode")
-                    doc.xref_set_key(xref, "ColorSpace", "/DeviceRGB")
-                    doc.xref_set_key(xref, "BitsPerComponent", "8")
-                    doc.xref_set_key(xref, "Width", str(pix.width))
-                    doc.xref_set_key(xref, "Height", str(pix.height))
-                    pix = None
-                except Exception:
-                    continue
+        # الطريقة الرسمية الآمنة لإعادة ضغp الصور (تحافظ على المحتوى)
+        try:
+            doc.rewrite_images(
+                dpi_threshold=cfg["dpi"] + 30,
+                dpi_target=cfg["dpi"],
+                quality=cfg["quality"],
+            )
+        except Exception:
+            pass  # إن لم تتوفّر، نكتفي بإعادة الحفp المضغوط أدناه
         out = doc.tobytes(garbage=4, deflate=True, clean=True)
     finally:
         doc.close()
@@ -281,20 +264,6 @@ async def compress_pdf(file: UploadFile = File(...), level: str = Form("medium")
             "Content-Disposition": "attachment; filename=compressed.pdf",
         },
     )
-
-
-def _resize_pix(fitz, pix, new_w, new_h):
-    """تصغير pixmap عبر insert_image في صفحة بحجم جديد (آمن)."""
-    try:
-        src_png = pix.tobytes("png")
-        tmp = fitz.open()
-        pg = tmp.new_page(width=new_w, height=new_h)
-        pg.insert_image(fitz.Rect(0, 0, new_w, new_h), stream=src_png)
-        result = pg.get_pixmap(matrix=fitz.Identity, alpha=False)
-        tmp.close()
-        return result
-    except Exception:
-        return pix
 
 
 # ------------------------------------------------------------------
