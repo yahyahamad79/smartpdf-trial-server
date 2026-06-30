@@ -199,9 +199,9 @@ async def render_page_legacy(file: UploadFile = File(...), page: int = Form(0)):
 # قيم صحيحة متمايزة.
 #
 COMPRESS_PRESETS = {
-    "low":    dict(dpi_threshold=200, dpi_target=150, quality=70),  # خفيف
-    "medium": dict(dpi_threshold=150, dpi_target=110, quality=55),  # متوازن
-    "high":   dict(dpi_threshold=120, dpi_target=90,  quality=40),  # أقصى
+    "low":    dict(dpi_threshold=150, dpi_target=110, quality=65),  # خفيف
+    "medium": dict(dpi_threshold=110, dpi_target=84,  quality=55),  # متوازن
+    "high":   dict(dpi_threshold=90,  dpi_target=60,  quality=42),  # أقصى توفير
 }
 
 @app.post("/compress")
@@ -225,16 +225,17 @@ async def compress_pdf(
         raise HTTPException(status_code=400, detail="Invalid PDF")
 
     try:
-        # أعد ضغط الصور (المصدر الأكبر للحجم) — الدالة الرسمية الآمنة
+        # أعد ضغط الصور (المصدر الأكبر للحجم) — الدالة الرسمية الآمنة.
+        # lossy فقط (بلا lossless) لتجنّب مضاعفة زمن المعالجة على Render المجاني.
         doc.rewrite_images(
             dpi_threshold=cfg["dpi_threshold"],
             dpi_target=cfg["dpi_target"],
             quality=cfg["quality"],
             lossy=True,
-            lossless=True,
+            lossless=False,
         )
-        # نظّف وادمج (garbage) واضغط البنية (deflate)
-        out = doc.tobytes(garbage=4, deflate=True, clean=True)
+        # ادمج البنية واضغطها (garbage=3 أسرع من 4 على المستندات الكبيرة)
+        out = doc.tobytes(garbage=3, deflate=True)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Compress failed: {e}")
     finally:
