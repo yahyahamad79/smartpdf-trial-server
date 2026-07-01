@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 python-multipart
 PyMuPDF
+psycopg2-binary

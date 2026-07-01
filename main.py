@@ -13,6 +13,7 @@
 # ════════════════════════════════════════════════════════════════
 
 import io
+import os
 import time
 import sqlite3
 import threading
@@ -28,7 +29,7 @@ app = FastAPI(title="Smart PDF Server")
 # الإعدادات
 # ─────────────────────────────────────────────────────────────
 TRIAL_DAYS      = 7           # المدة الافتراضية للأجهزة الجديدة
-TOKEN     = "yahyahamad"  # ⚠️ غيّره لكلمة سر قوية — يحمي نقاط الإدارة
+ADMIN_TOKEN     = "CHANGE_ME_smartpdf_2026"  # ⚠️ غيّره لكلمة سر قوية — يحمي نقاط الإدارة
 DB_PATH         = "trial.db"
 MAX_UPLOAD_MB   = 60          # حد رفع المعاينة
 MAX_COMPRESS_MB = 100         # حد رفع الضغط (أكبر — الملفات الكبيرة)
@@ -38,38 +39,80 @@ MAX_SESSIONS    = 40
 # ─────────────────────────────────────────────────────────────
 # قاعدة بيانات التجربة (SQLite)
 # ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# قاعدة بيانات التجربة — تدعم Postgres (دائم) أو SQLite (احتياطي)
+#
+# الكشف تلقائي: إن وُجد متغيّر البيئة DATABASE_URL (رابط Neon/Postgres)
+# يُستخدم Postgres الدائم. وإلا يعود لـ SQLite المحلي (مؤقت على Render).
+#
+# ⚠️ على Render المجاني، SQLite يُمسح مع كل نشر/نوم. لذا للاستمرارية:
+#    أنشئ قاعدة Neon مجانية، وأضف رابطها في متغيّر البيئة DATABASE_URL.
+# ─────────────────────────────────────────────────────────────
 _db_lock = threading.Lock()
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+USE_PG = DATABASE_URL.startswith("postgres")
+
+if USE_PG:
+    import psycopg2
+    # علامة النائب في Postgres هي %s (بدل ? في SQLite)
+    _PH = "%s"
+else:
+    _PH = "?"
+
+def _connect():
+    """يفتح اتصالاً بقاعدة البيانات المناسبة."""
+    if USE_PG:
+        return psycopg2.connect(DATABASE_URL)
+    return sqlite3.connect(DB_PATH)
+
+def _q(sql: str) -> str:
+    """يحوّل علامات النائب ? إلى %s عند استخدام Postgres."""
+    return sql.replace("?", _PH) if USE_PG else sql
 
 def _init_db():
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS trials (
-                device_id  TEXT PRIMARY KEY,
-                started_at TEXT NOT NULL,
-                trial_days INTEGER NOT NULL DEFAULT 7
-            )
-        """)
-        # ترحيل: أضف عمود trial_days للجداول القديمة إن لم يكن موجوداً
-        cols = [r[1] for r in c.execute("PRAGMA table_info(trials)").fetchall()]
-        if "trial_days" not in cols:
-            c.execute(f"ALTER TABLE trials ADD COLUMN trial_days INTEGER NOT NULL DEFAULT {TRIAL_DAYS}")
-        c.commit()
+    with _db_lock, _connect() as conn:
+        c = conn.cursor()
+        if USE_PG:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS trials (
+                    device_id  TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    trial_days INTEGER NOT NULL DEFAULT 7
+                )
+            """)
+        else:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS trials (
+                    device_id  TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    trial_days INTEGER NOT NULL DEFAULT 7
+                )
+            """)
+            # ترحيل SQLite القديم: أضف العمود إن لم يكن موجوداً
+            cols = [r[1] for r in c.execute("PRAGMA table_info(trials)").fetchall()]
+            if "trial_days" not in cols:
+                c.execute(
+                    f"ALTER TABLE trials ADD COLUMN trial_days INTEGER NOT NULL DEFAULT {TRIAL_DAYS}"
+                )
+        conn.commit()
 
 _init_db()
 
 def _trial_status(device_id: str):
     """يقرأ (أو يُنشئ) سجل الجهاز ويعيد الحالة الكاملة. الخادم مصدر الحقيقة."""
     now = datetime.now(timezone.utc)
-    with _db_lock, sqlite3.connect(DB_PATH) as c:
-        row = c.execute(
-            "SELECT started_at, trial_days FROM trials WHERE device_id=?", (device_id,)
-        ).fetchone()
+    with _db_lock, _connect() as conn:
+        c = conn.cursor()
+        c.execute(
+            _q("SELECT started_at, trial_days FROM trials WHERE device_id=?"), (device_id,)
+        )
+        row = c.fetchone()
         if row is None:
             c.execute(
-                "INSERT INTO trials(device_id, started_at, trial_days) VALUES(?,?,?)",
+                _q("INSERT INTO trials(device_id, started_at, trial_days) VALUES(?,?,?)"),
                 (device_id, now.isoformat(), TRIAL_DAYS),
             )
-            c.commit()
+            conn.commit()
             started, days = now, TRIAL_DAYS
         else:
             started = datetime.fromisoformat(row[0])
@@ -130,7 +173,7 @@ async def trial_extend(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="JSON body required")
 
-    if body.get("token") != TOKEN:
+    if body.get("token") != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     device_id = body.get("device_id") or body.get("deviceId")
@@ -141,25 +184,27 @@ async def trial_extend(request: Request):
     reset_start = bool(body.get("reset_start", False))
     now = datetime.now(timezone.utc)
 
-    with _db_lock, sqlite3.connect(DB_PATH) as c:
-        row = c.execute("SELECT started_at FROM trials WHERE device_id=?", (device_id,)).fetchone()
+    with _db_lock, _connect() as conn:
+        c = conn.cursor()
+        c.execute(_q("SELECT started_at FROM trials WHERE device_id=?"), (device_id,))
+        row = c.fetchone()
         if row is None:
             c.execute(
-                "INSERT INTO trials(device_id, started_at, trial_days) VALUES(?,?,?)",
+                _q("INSERT INTO trials(device_id, started_at, trial_days) VALUES(?,?,?)"),
                 (device_id, now.isoformat(), days),
             )
         else:
             if reset_start:
                 c.execute(
-                    "UPDATE trials SET trial_days=?, started_at=? WHERE device_id=?",
+                    _q("UPDATE trials SET trial_days=?, started_at=? WHERE device_id=?"),
                     (days, now.isoformat(), device_id),
                 )
             else:
                 c.execute(
-                    "UPDATE trials SET trial_days=? WHERE device_id=?",
+                    _q("UPDATE trials SET trial_days=? WHERE device_id=?"),
                     (days, device_id),
                 )
-        c.commit()
+        conn.commit()
 
     return _trial_status(str(device_id))
 
@@ -167,14 +212,14 @@ async def trial_extend(request: Request):
 @app.get("/trial/list")
 async def trial_list(token: str = ""):
     """عرض كل الأجهزة وحالتها (إداري). الاستخدام: /trial/list?token=..."""
-    if token != TOKEN:
+    if token != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
     now = datetime.now(timezone.utc)
     out = []
-    with _db_lock, sqlite3.connect(DB_PATH) as c:
-        for did, started_at, days in c.execute(
-            "SELECT device_id, started_at, trial_days FROM trials"
-        ).fetchall():
+    with _db_lock, _connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT device_id, started_at, trial_days FROM trials")
+        for did, started_at, days in c.fetchall():
             started = datetime.fromisoformat(started_at)
             elapsed = (now - started).total_seconds() / 86400.0
             remaining = max(0, int(days) - int(elapsed))
