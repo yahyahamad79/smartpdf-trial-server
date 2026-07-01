@@ -28,7 +28,7 @@ app = FastAPI(title="Smart PDF Server")
 # الإعدادات
 # ─────────────────────────────────────────────────────────────
 TRIAL_DAYS      = 7           # المدة الافتراضية للأجهزة الجديدة
-ADMIN_TOKEN     = "CHANGE_ME_smartpdf_2026"  # ⚠️ غيّره لكلمة سر قوية — يحمي نقاط الإدارة
+ADMIN_TOKEN     = "yahyahamad"  # ⚠️ غيّره لكلمة سر قوية — يحمي نقاط الإدارة
 DB_PATH         = "trial.db"
 MAX_UPLOAD_MB   = 60          # حد رفع المعاينة
 MAX_COMPRESS_MB = 100         # حد رفع الضغط (أكبر — الملفات الكبيرة)
