@@ -19,7 +19,7 @@ import threading
 from datetime import datetime, timezone
 
 import fitz  # PyMuPDF
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Path
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Path, Request
 from fastapi.responses import Response, JSONResponse, HTMLResponse, PlainTextResponse
 
 app = FastAPI(title="Smart PDF Server")
@@ -27,7 +27,8 @@ app = FastAPI(title="Smart PDF Server")
 # ─────────────────────────────────────────────────────────────
 # الإعدادات
 # ─────────────────────────────────────────────────────────────
-TRIAL_DAYS      = 7
+TRIAL_DAYS      = 7           # المدة الافتراضية للأجهزة الجديدة
+ADMIN_TOKEN     = "CHANGE_ME_smartpdf_2026"  # ⚠️ غيّره لكلمة سر قوية — يحمي نقاط الإدارة
 DB_PATH         = "trial.db"
 MAX_UPLOAD_MB   = 60          # حد رفع المعاينة
 MAX_COMPRESS_MB = 100         # حد رفع الضغط (أكبر — الملفات الكبيرة)
@@ -44,43 +45,145 @@ def _init_db():
         c.execute("""
             CREATE TABLE IF NOT EXISTS trials (
                 device_id  TEXT PRIMARY KEY,
-                started_at TEXT NOT NULL
+                started_at TEXT NOT NULL,
+                trial_days INTEGER NOT NULL DEFAULT 7
             )
         """)
+        # ترحيل: أضف عمود trial_days للجداول القديمة إن لم يكن موجوداً
+        cols = [r[1] for r in c.execute("PRAGMA table_info(trials)").fetchall()]
+        if "trial_days" not in cols:
+            c.execute(f"ALTER TABLE trials ADD COLUMN trial_days INTEGER NOT NULL DEFAULT {TRIAL_DAYS}")
         c.commit()
 
 _init_db()
 
-@app.post("/trial/check")
-async def trial_check(device_id: str = Form(...)):
-    """يُسجّل بداية التجربة عند أول مرة، ويُرجع الأيام المتبقية."""
-    if not device_id or len(device_id) < 4:
-        raise HTTPException(status_code=400, detail="Invalid device id")
-
+def _trial_status(device_id: str):
+    """يقرأ (أو يُنشئ) سجل الجهاز ويعيد الحالة الكاملة. الخادم مصدر الحقيقة."""
     now = datetime.now(timezone.utc)
     with _db_lock, sqlite3.connect(DB_PATH) as c:
         row = c.execute(
-            "SELECT started_at FROM trials WHERE device_id=?", (device_id,)
+            "SELECT started_at, trial_days FROM trials WHERE device_id=?", (device_id,)
         ).fetchone()
         if row is None:
             c.execute(
-                "INSERT INTO trials(device_id, started_at) VALUES(?,?)",
-                (device_id, now.isoformat()),
+                "INSERT INTO trials(device_id, started_at, trial_days) VALUES(?,?,?)",
+                (device_id, now.isoformat(), TRIAL_DAYS),
             )
             c.commit()
-            started = now
+            started, days = now, TRIAL_DAYS
         else:
             started = datetime.fromisoformat(row[0])
+            days = int(row[1])
 
     elapsed_days = (now - started).total_seconds() / 86400.0
-    remaining = max(0, TRIAL_DAYS - int(elapsed_days))
+    remaining = max(0, days - int(elapsed_days))
     return {
         "device_id": device_id,
-        "trial_days": TRIAL_DAYS,
+        "trial_days": days,
+        "started_at": started.isoformat(),
+        # نرسل أسماء متعددة للتوافق مع التطبيق (firstSeen + daysLeft + snake_case)
+        "firstSeen": started.isoformat(),
+        "daysLeft": remaining,
         "days_remaining": remaining,
         "expired": remaining <= 0,
-        "started_at": started.isoformat(),
     }
+
+
+async def _read_device_id(request: Request) -> str:
+    """يقبل device_id سواء أُرسل كـ JSON (deviceId/device_id) أو Form."""
+    dev = None
+    ctype = request.headers.get("content-type", "")
+    if "application/json" in ctype:
+        try:
+            body = await request.json()
+            dev = body.get("deviceId") or body.get("device_id")
+        except Exception:
+            dev = None
+    else:
+        try:
+            form = await request.form()
+            dev = form.get("device_id") or form.get("deviceId")
+        except Exception:
+            dev = None
+    if not dev or len(str(dev)) < 4:
+        raise HTTPException(status_code=400, detail="Invalid device id")
+    return str(dev)
+
+
+@app.post("/trial/check")
+async def trial_check(request: Request):
+    """تحقق/تسجيل تجربة الجهاز. الخادم مصدر الحقيقة للمدة والأيام المتبقية."""
+    device_id = await _read_device_id(request)
+    return _trial_status(device_id)
+
+
+@app.post("/trial/extend")
+async def trial_extend(request: Request):
+    """
+    تمديد تجربة جهاز معيّن (إداري — يتطلب التوكن).
+    الاستخدام: POST مع JSON { "token": "...", "device_id": "...", "days": 20 }
+      • days = المدة الإجمالية الجديدة (لا إضافة). مثال: 20 = تصبح المدة 20 يوماً.
+      • reset_start=true (اختياري) => يعيد بداية التجربة من الآن (تمديد فعلي كامل).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON body required")
+
+    if body.get("token") != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    device_id = body.get("device_id") or body.get("deviceId")
+    if not device_id or len(str(device_id)) < 4:
+        raise HTTPException(status_code=400, detail="Invalid device id")
+
+    days = int(body.get("days", TRIAL_DAYS))
+    reset_start = bool(body.get("reset_start", False))
+    now = datetime.now(timezone.utc)
+
+    with _db_lock, sqlite3.connect(DB_PATH) as c:
+        row = c.execute("SELECT started_at FROM trials WHERE device_id=?", (device_id,)).fetchone()
+        if row is None:
+            c.execute(
+                "INSERT INTO trials(device_id, started_at, trial_days) VALUES(?,?,?)",
+                (device_id, now.isoformat(), days),
+            )
+        else:
+            if reset_start:
+                c.execute(
+                    "UPDATE trials SET trial_days=?, started_at=? WHERE device_id=?",
+                    (days, now.isoformat(), device_id),
+                )
+            else:
+                c.execute(
+                    "UPDATE trials SET trial_days=? WHERE device_id=?",
+                    (days, device_id),
+                )
+        c.commit()
+
+    return _trial_status(str(device_id))
+
+
+@app.get("/trial/list")
+async def trial_list(token: str = ""):
+    """عرض كل الأجهزة وحالتها (إداري). الاستخدام: /trial/list?token=..."""
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    now = datetime.now(timezone.utc)
+    out = []
+    with _db_lock, sqlite3.connect(DB_PATH) as c:
+        for did, started_at, days in c.execute(
+            "SELECT device_id, started_at, trial_days FROM trials"
+        ).fetchall():
+            started = datetime.fromisoformat(started_at)
+            elapsed = (now - started).total_seconds() / 86400.0
+            remaining = max(0, int(days) - int(elapsed))
+            out.append({
+                "device_id": did, "started_at": started_at,
+                "trial_days": days, "days_remaining": remaining,
+                "expired": remaining <= 0,
+            })
+    return {"count": len(out), "devices": out}
 
 # ─────────────────────────────────────────────────────────────
 # health check  (يُستخدم لإيقاظ السيرفر قبل عملية ثقيلة)
