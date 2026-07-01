@@ -28,7 +28,7 @@ app = FastAPI(title="Smart PDF Server")
 # الإعدادات
 # ─────────────────────────────────────────────────────────────
 TRIAL_DAYS      = 7           # المدة الافتراضية للأجهزة الجديدة
-TOKEN     = "yahyahamad"  # ⚠️ غيّره لكلمة سر قوية — يحمي نقاط الإدارة
+ADMIN_TOKEN     = "CHANGE_ME_smartpdf_2026"  # ⚠️ غيّره لكلمة سر قوية — يحمي نقاط الإدارة
 DB_PATH         = "trial.db"
 MAX_UPLOAD_MB   = 60          # حد رفع المعاينة
 MAX_COMPRESS_MB = 100         # حد رفع الضغط (أكبر — الملفات الكبيرة)
@@ -130,7 +130,7 @@ async def trial_extend(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="JSON body required")
 
-    if body.get("token") != TOKEN:
+    if body.get("token") != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     device_id = body.get("device_id") or body.get("deviceId")
@@ -167,7 +167,7 @@ async def trial_extend(request: Request):
 @app.get("/trial/list")
 async def trial_list(token: str = ""):
     """عرض كل الأجهزة وحالتها (إداري). الاستخدام: /trial/list?token=..."""
-    if token != TOKEN:
+    if token != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
     now = datetime.now(timezone.utc)
     out = []
@@ -191,6 +191,175 @@ async def trial_list(token: str = ""):
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "smartpdf", "ts": int(time.time())}
+
+# ─────────────────────────────────────────────────────────────
+# لوحة التحكم الإدارية  (/admin)
+# صفحة ويب واحدة: عرض كل الأجهزة + تعديل المدة لأي جهاز.
+# محميّة بالتوكن (يُدخله المستخدم في الصفحة، ويُرسل مع كل طلب).
+# ─────────────────────────────────────────────────────────────
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    return """<!doctype html>
+<html lang="ar" dir="rtl"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart PDF — لوحة التحكم</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, 'Segoe UI', Tahoma, sans-serif; background:#0f172a; color:#f1f5f9; margin:0; padding:0; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 20px 16px 60px; }
+  h1 { font-size: 20px; font-weight: 700; margin: 8px 0 4px; }
+  .sub { color:#94a3b8; font-size:13px; margin-bottom:20px; }
+  .login { background:#1e293b; border:1px solid #334155; border-radius:14px; padding:20px; max-width:420px; margin:40px auto; }
+  .login label { display:block; font-size:13px; color:#94a3b8; margin-bottom:8px; }
+  input { width:100%; background:#0f172a; border:1px solid #334155; color:#f1f5f9; border-radius:10px; padding:11px 12px; font-size:14px; }
+  input:focus { outline:none; border-color:#7C3AED; }
+  button { background:#7C3AED; color:#fff; border:none; border-radius:10px; padding:11px 16px; font-size:14px; font-weight:600; cursor:pointer; }
+  button:active { opacity:.85; }
+  button.sm { padding:7px 12px; font-size:13px; }
+  button.gray { background:#334155; }
+  .bar { display:flex; gap:10px; align-items:center; margin-bottom:16px; flex-wrap:wrap; }
+  .bar .stat { background:#1e293b; border:1px solid #334155; border-radius:10px; padding:8px 14px; font-size:13px; }
+  .card { background:#1e293b; border:1px solid #334155; border-radius:14px; padding:14px; margin-bottom:12px; }
+  .did { font-family:monospace; font-size:13px; color:#c4b5fd; word-break:break-all; }
+  .meta { display:flex; gap:16px; flex-wrap:wrap; margin:10px 0; font-size:13px; color:#94a3b8; }
+  .meta b { color:#f1f5f9; font-weight:600; }
+  .badge { display:inline-block; padding:2px 10px; border-radius:20px; font-size:12px; font-weight:600; }
+  .ok { background:#14532d; color:#4ade80; }
+  .no { background:#4c1d1d; color:#f87171; }
+  .actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px; }
+  .actions input { width:70px; }
+  .hint { font-size:12px; color:#64748b; }
+  .msg { margin-top:6px; font-size:13px; min-height:18px; }
+  .hidden { display:none; }
+  .spin { color:#94a3b8; text-align:center; padding:30px; }
+</style></head>
+<body>
+<div class="wrap">
+
+  <!-- شاشة الدخول -->
+  <div id="loginBox" class="login">
+    <h1>🔒 لوحة تحكم Smart PDF</h1>
+    <label>أدخل رمز الإدارة (Admin Token)</label>
+    <input id="tokenInput" type="password" placeholder="التوكن السري" />
+    <div style="height:12px"></div>
+    <button onclick="login()" style="width:100%">دخول</button>
+    <div id="loginMsg" class="msg"></div>
+  </div>
+
+  <!-- اللوحة -->
+  <div id="panel" class="hidden">
+    <h1>لوحة تحكم Smart PDF</h1>
+    <div class="sub">إدارة تجارب المستخدمين — عرض وتحديث المدة لأي جهاز.</div>
+    <div class="bar">
+      <button class="sm" onclick="load()">🔄 تحديث القائمة</button>
+      <div class="stat">الأجهزة: <b id="count">0</b></div>
+      <button class="sm gray" onclick="logout()">خروج</button>
+    </div>
+    <div id="list"><div class="spin">جارٍ التحميل…</div></div>
+  </div>
+
+</div>
+
+<script>
+  var TOKEN = '';
+  var BASE = window.location.origin;
+
+  function login() {
+    var t = document.getElementById('tokenInput').value.trim();
+    if (!t) { msg('loginMsg', 'أدخل التوكن'); return; }
+    TOKEN = t;
+    // نتحقق بجلب القائمة
+    fetch(BASE + '/trial/list?token=' + encodeURIComponent(TOKEN))
+      .then(function(r){ if(!r.ok) throw new Error('توكن غير صحيح'); return r.json(); })
+      .then(function(){
+        document.getElementById('loginBox').classList.add('hidden');
+        document.getElementById('panel').classList.remove('hidden');
+        try { sessionStorage.setItem('spdf_admin', TOKEN); } catch(e){}
+        load();
+      })
+      .catch(function(e){ msg('loginMsg', '❌ ' + e.message); });
+  }
+
+  function logout() {
+    TOKEN = '';
+    try { sessionStorage.removeItem('spdf_admin'); } catch(e){}
+    document.getElementById('panel').classList.add('hidden');
+    document.getElementById('loginBox').classList.remove('hidden');
+  }
+
+  function load() {
+    document.getElementById('list').innerHTML = '<div class="spin">جارٍ التحميل…</div>';
+    fetch(BASE + '/trial/list?token=' + encodeURIComponent(TOKEN))
+      .then(function(r){ return r.json(); })
+      .then(function(data){
+        var devs = data.devices || [];
+        document.getElementById('count').textContent = devs.length;
+        if (devs.length === 0) {
+          document.getElementById('list').innerHTML = '<div class="spin">لا توجد أجهزة مسجّلة بعد.</div>';
+          return;
+        }
+        var html = '';
+        window._devs = devs;
+        for (var i=0; i<devs.length; i++) {
+          var d = devs[i];
+          var active = !d.expired;
+          html += '<div class="card">'
+            + '<div class="did">' + esc(d.device_id) + '</div>'
+            + '<div class="meta">'
+            +   '<span>الحالة: <span class="badge ' + (active?'ok':'no') + '">' + (active?'فعّالة':'منتهية') + '</span></span>'
+            +   '<span>المتبقّي: <b>' + d.days_remaining + '</b> يوم</span>'
+            +   '<span>المدة: <b>' + d.trial_days + '</b> يوم</span>'
+            +   '<span>البدء: <b>' + fmt(d.started_at) + '</b></span>'
+            + '</div>'
+            + '<div class="actions">'
+            +   '<span class="hint">مدة جديدة:</span>'
+            +   '<input id="days_' + i + '" type="number" min="1" value="20" />'
+            +   '<button class="sm" onclick="extend(' + i + ', true)">تمديد كامل (يبدأ الآن)</button>'
+            +   '<button class="sm gray" onclick="extend(' + i + ', false)">تعديل المدة فقط</button>'
+            + '</div>'
+            + '<div class="msg" id="msg_' + i + '"></div>'
+            + '</div>';
+        }
+        document.getElementById('list').innerHTML = html;
+      })
+      .catch(function(e){
+        document.getElementById('list').innerHTML = '<div class="spin">خطأ: ' + esc(e.message) + '</div>';
+      });
+  }
+
+  function extend(idx, resetStart) {
+    var deviceId = window._devs[idx].device_id;
+    var days = parseInt(document.getElementById('days_' + idx).value, 10);
+    if (!days || days < 1) { msg('msg_'+idx, 'أدخل عدد أيام صحيح'); return; }
+    msg('msg_'+idx, '⏳ جارٍ التحديث…');
+    fetch(BASE + '/trial/extend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: TOKEN, device_id: deviceId, days: days, reset_start: resetStart })
+    })
+    .then(function(r){ if(!r.ok) throw new Error('فشل (' + r.status + ')'); return r.json(); })
+    .then(function(res){
+      msg('msg_'+idx, '✅ تم — المتبقّي الآن ' + res.days_remaining + ' يوم');
+      setTimeout(load, 900);
+    })
+    .catch(function(e){ msg('msg_'+idx, '❌ ' + e.message); });
+  }
+
+  function msg(id, t){ var el=document.getElementById(id); if(el) el.textContent=t; }
+  function esc(s){ var d=document.createElement('div'); d.textContent=s==null?'':String(s); return d.innerHTML; }
+  function fmt(iso){ try { return new Date(iso).toLocaleDateString('ar-EG'); } catch(e){ return iso; } }
+
+  // استعادة الجلسة إن وُجدت
+  (function(){
+    try {
+      var saved = sessionStorage.getItem('spdf_admin');
+      if (saved) { document.getElementById('tokenInput').value = saved; login(); }
+    } catch(e){}
+  })();
+</script>
+</body></html>"""
+
 
 # ─────────────────────────────────────────────────────────────
 # سياسة الخصوصية
