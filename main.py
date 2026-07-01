@@ -28,7 +28,7 @@ app = FastAPI(title="Smart PDF Server")
 # الإعدادات
 # ─────────────────────────────────────────────────────────────
 TRIAL_DAYS      = 7           # المدة الافتراضية للأجهزة الجديدة
-ADMIN_TOKEN     = "yahyahamad"  # ⚠️ غيّره لكلمة سر قوية — يحمي نقاط الإدارة
+TOKEN     = "yahyahamad"  # ⚠️ غيّره لكلمة سر قوية — يحمي نقاط الإدارة
 DB_PATH         = "trial.db"
 MAX_UPLOAD_MB   = 60          # حد رفع المعاينة
 MAX_COMPRESS_MB = 100         # حد رفع الضغط (أكبر — الملفات الكبيرة)
@@ -130,7 +130,7 @@ async def trial_extend(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="JSON body required")
 
-    if body.get("token") != ADMIN_TOKEN:
+    if body.get("token") != TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     device_id = body.get("device_id") or body.get("deviceId")
@@ -167,7 +167,7 @@ async def trial_extend(request: Request):
 @app.get("/trial/list")
 async def trial_list(token: str = ""):
     """عرض كل الأجهزة وحالتها (إداري). الاستخدام: /trial/list?token=..."""
-    if token != ADMIN_TOKEN:
+    if token != TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
     now = datetime.now(timezone.utc)
     out = []
